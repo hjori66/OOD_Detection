@@ -44,30 +44,16 @@ def ood_test_baseline(model, id_train_loader, id_test_loader, ood_test_loader, a
             
 
 def mahalanobis_distance(pred, class_mu, inv_tied_cov):
-    # pred_y = pred.cpu().detach().numpy()
-    # delta = np.repeat(pred_y[:, :, np.newaxis], class_mu.shape[0], axis=-1) - np.repeat(class_mu[np.newaxis, :, :], pred.shape[0], axis=0)   # B, C, D
-    # delta = np.transpose(delta, [0, 2, 1])   # B, D, C
-    # check1 = np.einsum('bdc,cy->bdy', delta, inv_tied_cov)
-    # check2 = np.einsum('bdy,bdc->bd', np.einsum('bdc,cy->bdy', delta, inv_tied_cov), delta)
-
-    # class_mu_tensor = torch.cuda.FloatTensor(class_mu)
-    # inv_tied_cov_tensor = torch.cuda.FloatTensor(inv_tied_cov)
-    # a = torch.repeat_interleave(pred.view(1, -1, 10), repeats=10, dim=0)  # C, B, D
-    # a = a.permute(1, 0, 2)
-    # b = torch.repeat_interleave(class_mu_tensor.view(1, 10, 10), repeats=pred.size()[0], dim=0)   # B, D, C
-    # delta_tensor = a-b
-    # check1 = torch.einsum('bdc,xd->bcx', delta_tensor, inv_tied_cov_tensor)
-    # check2 = torch.einsum('bcx,bdc->bd', check1, delta_tensor)
-
     scores = []
-    inv_tied_cov_tensor = torch.cuda.FloatTensor(inv_tied_cov)
     for mu in class_mu:
-        mu_tensor = torch.cuda.FloatTensor(mu)
-        delta_tensor = pred - torch.repeat_interleave(mu_tensor.view(1, -1), repeats=pred.size(0), dim=0)
-        check1 = torch.einsum('bc,cx->bx', delta_tensor, inv_tied_cov_tensor)
-        check2 = torch.einsum('bx,bx->b', check1, delta_tensor)
-        scores.append(-check2)
-    return torch.stack(scores, dim=-1)
+        # delta = pred - torch.repeat_interleave(mu.view(1, -1), repeats=pred.size(0), dim=0)
+        delta = pred - mu[None:, ]
+        # check1 = torch.einsum('bc,cx->bx', delta, inv_tied_cov)
+        # check2 = torch.einsum('bx,bx->b', check1, delta)
+        # scores.append(-check2)
+        scores.append(
+            -torch.diag(torch.matmul(torch.matmul(delta, inv_tied_cov), delta.t()), 0))
+    return torch.stack(scores)
 
 
 def ood_test_mahalanobis(model, id_train_loader, id_test_loader, ood_test_loader, args):
@@ -77,53 +63,83 @@ def ood_test_mahalanobis(model, id_train_loader, id_test_loader, ood_test_loader
         - If you don't use input pre-processing, performance will be degenerated, but whether to use it is up to you.
     """
     model = model.cuda()
-    model.eval()
+    model.train()
+
+    feature_num = -2
+    num_class = 10
+    num_dim = 10
+    num_data_per_class = 5000
 
     with torch.no_grad():
-        total_pred = []
-        for _ in range(10):
-            total_pred.append(list())
+        total_feature = []
+        for _ in range(num_class):
+            total_feature.append(list())
 
         for x, y in id_train_loader:
             x, y = x.cuda(), y.cuda()
 
-            pred, feature_list = model(x)
+            """ Why Wrong..?
+            pred, _ = model(x)
             for i, label in enumerate(y.cpu().detach().numpy()):
                 total_pred[label].append(pred.cpu().detach().numpy()[i])
+            """
 
-    class_mu = []
-    for i, class_pred in enumerate(total_pred):
-        class_mu.append(np.stack(class_pred).mean(axis=0))
-    class_mu = np.stack(class_mu)
+            for i in range(num_class):
+                pred, feature_list = model(x[y == i])
+                if feature_num == 0:
+                    total_feature[i].extend(pred)
+                else:
 
-    class_cov = []
-    for i, class_pred in enumerate(total_pred):
-        mu = class_mu[i]
-        cov_list = []
-        for pred in class_pred:
-            y = (pred - mu).reshape(1, -1)
-            cov_list.append(np.matmul(y.transpose(), y))
-        class_cov.append(np.stack(cov_list).mean(axis=0))
-    class_cov = np.array(class_cov)
+                    total_feature[i].extend(feature_list[feature_num])
 
-    tied_cov = class_cov.mean(axis=0)
-    inv_tied_cov = np.linalg.inv(tied_cov)
+        """ Why Wrong..?
+        class_mu = []
+        for i, class_pred in enumerate(total_pred):
+            class_mu.append((np.stack(class_pred)).mean(axis=0))
+        class_mu = np.stack(class_mu)
+        """
+
+        class_mu = []
+        feature_vectors = []
+        for i, class_pred in enumerate(total_feature):
+            feature_vector = torch.cat(class_pred, dim=0).view(num_data_per_class, num_class)
+            feature_vectors.append(feature_vector)
+            class_mu.append(feature_vector.mean(dim=0))
+
+        class_cov = []
+        for i, class_pred in enumerate(total_feature):
+            feature_vector = feature_vectors[i]
+            mu = class_mu[i]
+
+            new_feature_vector = feature_vector - mu[None, :]
+            cov = torch.zeros(num_class, num_class, dtype=torch.float).cuda()
+            for row in new_feature_vector:
+                row = row.unsqueeze(1)
+                cov += torch.matmul(row, row.t())
+            class_cov.append(cov / num_data_per_class)
+        class_covs = torch.cat(class_cov).view(num_class, num_dim, num_dim)
+
+        tied_cov = class_covs.mean(axis=0)
+        # inv_tied_cov = np.linalg.inv(tied_cov)
+        inv_tied_cov = tied_cov.inverse()
 
     """
     - step 2. calculate test samples' confidence score
                 by using Mahalanobis distance and just calculated parameters of class conditional Gaussian distributions
     - step 3. calculate empircal mean and covariance of each of class conditional Gaussian distibtuion(CIFAR10 has 10 classes) 
     """
+    model = model.cuda()
+    model.eval()
+
     TPR = 0.
     TNR = 0.
     ID_ACC = 0.
     OOD_ACC = 0.
-    noisy_preprocessing = True
 
     for x, y in id_test_loader:
         x, y = x.cuda(), y.cuda()
 
-        if noisy_preprocessing:
+        if args.noisy_preprocessing:
             x.requires_grad = True
             pred, feature_list = model(x)
             md = mahalanobis_distance(pred, class_mu, inv_tied_cov).sum()
@@ -133,9 +149,14 @@ def ood_test_mahalanobis(model, id_train_loader, id_test_loader, ood_test_loader
         with torch.no_grad():
             pred, feature_list = model(x)
 
-            # confidence_score, pred_class = torch.max(torch.softmax(pred, dim=1), dim=1)
-            md = mahalanobis_distance(pred, class_mu, inv_tied_cov)
-            confidence_score, pred_class = torch.max(md, axis=1)
+            confidence_score_list = []
+
+            for mean_i in class_mu:
+                feature_vector = pred - mean_i[None:, ]
+                confidence_score_list.append(-torch.diag(torch.matmul(torch.matmul(feature_vector, tied_cov.inverse()), feature_vector.t()), 0))
+
+            confidence_score_list = torch.stack(confidence_score_list)
+            confidence_score, pred_class = torch.max(confidence_score_list, dim=0)
             TPR += (confidence_score > args.threshold).sum().item() / id_test_loader.batch_size
 
             ID_ACC += (((pred_class - y == 0).int()).sum()).item() / id_test_loader.batch_size
@@ -143,7 +164,7 @@ def ood_test_mahalanobis(model, id_train_loader, id_test_loader, ood_test_loader
     for x, y in ood_test_loader:
         x, y = x.cuda(), y.cuda()
 
-        if noisy_preprocessing:
+        if args.noisy_preprocessing:
             x.requires_grad = True
             pred, feature_list = model(x)
             md = mahalanobis_distance(pred, class_mu, inv_tied_cov).sum()
@@ -152,9 +173,15 @@ def ood_test_mahalanobis(model, id_train_loader, id_test_loader, ood_test_loader
 
         with torch.no_grad():
             pred, feature_list = model(x)
-            # confidence_score, pred_class = torch.max(torch.softmax(pred, dim=1), dim=1)
-            md = mahalanobis_distance(pred, class_mu, inv_tied_cov)
-            confidence_score, pred_class = torch.max(md, axis=1)
+
+            confidence_score_list = []
+
+            for mean_i in class_mu:
+                feature_vector = pred - mean_i[None:, ]
+                confidence_score_list.append(-torch.diag(torch.matmul(torch.matmul(feature_vector, tied_cov.inverse()), feature_vector.t()), 0))
+
+            confidence_score_list = torch.stack(confidence_score_list)
+            confidence_score, pred_class = torch.max(confidence_score_list, dim=0)
             TNR += (confidence_score < args.threshold).sum().item() / ood_test_loader.batch_size
 
             OOD_ACC += (((pred_class - y == 0).int()).sum()).item() / ood_test_loader.batch_size
@@ -185,11 +212,11 @@ if __name__ == "__main__":
         parser.add_argument('--alg', type=str, default='mahalanobis', help='baseline | mahalanobis')
 
         parser.add_argument('--train_bs', type=int, default=1000, help='Batch size of in_trainloader.')
-        parser.add_argument('--test_bs', type=int, default=256, help='Batch size of in_testloader and out_testloader.')
+        parser.add_argument('--test_bs', type=int, default=250, help='Batch size of in_testloader and out_testloader.')
 
-        parser.add_argument('--noisy_preprocessing', type=bool, default=True, help='Noise Pre-processing.')
+        parser.add_argument('--noisy_preprocessing', type=bool, default=False, help='Noise Pre-processing.')
         parser.add_argument('--epsilon_noise', type=int, default=1e-2, help='Parameter for Noise Pre-processing.')
-        parser.add_argument('--threshold', type=int, default=-23, help='Threshold.')
+        parser.add_argument('--threshold', type=int, default=-8, help='Threshold.')
         parser.add_argument('--num_workers', type=int, default=0)
 
         args = parser.parse_args()
